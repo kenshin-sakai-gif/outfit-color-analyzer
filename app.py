@@ -1,16 +1,17 @@
-# app.py
 import streamlit as st
 import numpy as np
 import cv2
 
-from core import analyze_rgb, AnalyzerConfig
+from core.segmentation import clothes_mask
+from core.colors import extract_dominant_colors, aggregate_by_deltaE
+from core.scoring import ratio_score, explain_text
+from core.visualize import fig_masks, fig_swatches
 
 st.set_page_config(page_title="Outfit Color Analyzer", layout="centered")
-st.title("Outfit Color Analyzer（Web版 / Phase 1）")
-st.write("人物抽出なしで，解析コア（Lab KMeans→ΔE統合→Top3→スコア）をWebで動作確認する段階である．")
+st.title("Outfit Color Analyzer")
+st.write("人物画像1枚からTop色・比率・スコアを算出する（Web版）．")
 
-uploaded = st.file_uploader("画像をアップロード（JPEG/PNG）", type=["jpg", "jpeg", "png"])
-
+uploaded = st.file_uploader("人物画像をアップロード（JPEG/PNG）", type=["jpg", "jpeg", "png"])
 
 def bytes_to_rgb(file_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(file_bytes, dtype=np.uint8)
@@ -18,7 +19,6 @@ def bytes_to_rgb(file_bytes: bytes) -> np.ndarray:
     if img is None:
         raise ValueError("画像の読み込みに失敗した．")
 
-    # RGBA -> 白背景合成
     if img.ndim == 3 and img.shape[2] == 4:
         alpha = img[..., 3].astype(np.float32) / 255.0
         bg = np.full_like(img[..., :3], 255)
@@ -29,48 +29,33 @@ def bytes_to_rgb(file_bytes: bytes) -> np.ndarray:
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return rgb
 
+def analyze_rgb(rgb: np.ndarray):
+    masks = clothes_mask(rgb)
+    cm = masks["clothes"]
 
-with st.expander("設定（Phase 1）", expanded=True):
-    k_global = st.slider("KMeansクラスタ数 k", min_value=5, max_value=15, value=10, step=1)
-    de_thresh = st.slider("ΔE統合しきい値", min_value=3.0, max_value=20.0, value=9.0, step=0.5)
-    min_presence = st.slider("ノイズ除外（最小比率）", min_value=0.0, max_value=0.10, value=0.03, step=0.01)
-    show_roi = st.checkbox("ROI（解析対象領域）も表示する", value=True)
-
-    cfg = AnalyzerConfig(
-        k_global=int(k_global),
-        deltae_merge_thresh=float(de_thresh),
-        agg_min_presence=float(min_presence),
+    centers_rgb, ratios = extract_dominant_colors(rgb, cm, k=10)
+    rep_colors, rep_ratios, labels = aggregate_by_deltaE(
+        centers_rgb, ratios, max_colors=3, de_thresh=9.0, min_presence=0.03
     )
+    score = ratio_score(rep_ratios)
+    return score, labels, rep_ratios, rep_colors, masks
 
 if uploaded is not None:
+    rgb = bytes_to_rgb(uploaded.read())
+    st.image(rgb, caption="入力画像", use_container_width=True)
+
     try:
-        rgb = bytes_to_rgb(uploaded.read())
-        st.image(rgb, caption="入力画像（RGB表示）", use_container_width=True)
+        with st.spinner("解析中..."):
+            score, labels, ratios, rep_colors, masks = analyze_rgb(rgb)
 
-        if st.button("解析する"):
-            out = analyze_rgb(rgb, cfg)
+        st.metric("スコア", f"{score} / 100")
+        for lab, r in zip(labels, ratios):
+            st.write(f"- {lab}: {float(r)*100:.1f}%")
 
-            st.subheader("結果")
-            st.metric("スコア", f"{out['score']} / 100")
+        st.code(explain_text(score, labels, ratios), language="text")
 
-            labels = out["labels"]
-            ratios = out["ratios"]
-
-            if len(labels) == 0:
-                st.warning("有効な色が抽出できなかった（ノイズ除外の閾値が高すぎる等）．")
-            else:
-                st.write("Top色・割合（再正規化）")
-                for lab, r in zip(labels, ratios):
-                    st.write(f"- {lab}: {float(r)*100:.1f}%")
-
-            st.pyplot(out["fig"], clear_figure=True)
-
-            if show_roi:
-                st.subheader("ROI（Phase 1 の暫定解析対象）")
-                st.image(out["rgb_roi"], caption="ROI", use_container_width=True)
-
-            st.info("次のPhaseでは，人物抽出（セグメンテーション）を追加して『服領域のみ』で同じ解析コアを回す．")
+        st.pyplot(fig_swatches(rep_colors, ratios, labels))
+        st.pyplot(fig_masks(rgb, masks["person"], masks["clothes"], masks["skin"], masks["hair"]))
 
     except Exception as e:
         st.error(f"処理に失敗した．理由: {e}")
-
