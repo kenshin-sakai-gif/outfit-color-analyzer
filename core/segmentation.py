@@ -134,16 +134,17 @@ def hair_mask_lab(rgb: np.ndarray, person_mask01: np.ndarray,
 # -------------------------
 def clothes_mask(rgb: np.ndarray) -> dict[str, np.ndarray]:
     """
-    戻り値: {"person","skin","hair","clothes"} (各0/1)
+    戻り値: {"person","skin","hair","clothes","used_fallback"} (各0/1 + フラグ)
     rembgが落ちても clothes は必ず返す（ROIフォールバック）
     """
     h, w = rgb.shape[:2]
     zeros = np.zeros((h, w), dtype=np.uint8)
 
+    used_fallback = False
     try:
         person = person_mask_rembg(rgb)
     except Exception:
-        # 最低限のフォールバック（止めない）
+        used_fallback = True
         person = _torso_roi_mask(h, w)
 
     skin = skin_mask_ycrcb(rgb, person) if person.sum() > 0 else zeros.copy()
@@ -153,4 +154,10 @@ def clothes_mask(rgb: np.ndarray) -> dict[str, np.ndarray]:
     clothes = np.clip(clothes, 0, 1).astype(np.uint8)
     clothes = _morph_clean(clothes, ksize=5, it=1)
 
-    return {"person": person, "skin": skin, "hair": hair, "clothes": clothes}
+    return {
+        "person": person,
+        "skin": skin,
+        "hair": hair,
+        "clothes": clothes,
+        "used_fallback": np.array([1], dtype=np.uint8) if used_fallback else np.array([0], dtype=np.uint8),
+    }
