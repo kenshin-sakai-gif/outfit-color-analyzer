@@ -1,11 +1,10 @@
-# core/segmentation.py
 from __future__ import annotations
 import numpy as np
 import cv2
 
-# -------------------------
+# =========================================================
 # utilities
-# -------------------------
+# =========================================================
 def _keep_largest_component(mask01: np.ndarray) -> np.ndarray:
     mask01 = (mask01 > 0).astype(np.uint8)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask01, connectivity=8)
@@ -22,7 +21,7 @@ def _morph_clean(mask01: np.ndarray, ksize: int = 5, it: int = 1) -> np.ndarray:
     return (m > 0).astype(np.uint8)
 
 def _torso_roi_mask(h: int, w: int,
-                    top: float = 0.02, bottom: float = 0.995,
+                    top: float = 0.08, bottom: float = 0.995,
                     left: float = 0.10, right: float = 0.90) -> np.ndarray:
     m = np.zeros((h, w), dtype=np.uint8)
     y1, y2 = int(h*top), int(h*bottom)
@@ -31,7 +30,6 @@ def _torso_roi_mask(h: int, w: int,
     return m
 
 def _resize_keep_aspect(rgb: np.ndarray, max_side: int = 1024) -> tuple[np.ndarray, float]:
-    """長辺 max_side に収めて縮小。scale は (new / old)."""
     h, w = rgb.shape[:2]
     scale = min(1.0, max_side / float(max(h, w)))
     if scale >= 1.0:
@@ -44,45 +42,33 @@ def _resize_mask_to(mask01_small: np.ndarray, h: int, w: int) -> np.ndarray:
     m = cv2.resize(mask01_small.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
     return (m > 0).astype(np.uint8)
 
-# -------------------------
-# person mask (rembg) with fallback
-# -------------------------
+# =========================================================
+# person mask (rembg)
+# =========================================================
 def person_mask_rembg(rgb: np.ndarray) -> np.ndarray:
-    """
-    入力: RGB uint8 (H,W,3)
-    出力: person mask 0/1 (H,W)
-    失敗時は例外を投げる（呼び出し側でfallbackする）
-    """
-    from rembg import remove  # ここでimport（失敗時に検知できるように）
+    from rembg import remove
 
-    if rgb.ndim != 3 or rgb.shape[2] != 3:
-        raise ValueError("rgbは(H,W,3)のRGB配列である必要がある．")
-
-    # rembg を軽くするため縮小して処理
     rgb_small, scale = _resize_keep_aspect(rgb, max_side=1024)
-
     ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb_small, cv2.COLOR_RGB2BGR))
     if not ok:
-        raise ValueError("画像のエンコードに失敗した．")
+        raise ValueError("encode failed")
 
-    out_bytes = remove(buf.tobytes())  # RGBA PNG bytes
-    out = cv2.imdecode(np.frombuffer(out_bytes, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-    if out is None or out.ndim != 3 or out.shape[2] != 4:
-        raise ValueError("rembgの出力が想定外である（RGBA PNGでない）．")
+    out_bytes = remove(buf.tobytes())
+    out = cv2.imdecode(np.frombuffer(out_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+    if out is None or out.shape[2] != 4:
+        raise ValueError("invalid rembg output")
 
     alpha = out[..., 3]
     mask01_small = (alpha > 0).astype(np.uint8)
     mask01_small = _keep_largest_component(mask01_small)
     mask01_small = _morph_clean(mask01_small, ksize=5, it=1)
 
-    # 元サイズに戻す
     h, w = rgb.shape[:2]
-    mask01 = _resize_mask_to(mask01_small, h, w)
-    return mask01
+    return _resize_mask_to(mask01_small, h, w)
 
-# -------------------------
-# skin / hair (lightweight)
-# -------------------------
+# =========================================================
+# skin
+# =========================================================
 def skin_mask_ycrcb(rgb: np.ndarray, base_mask01: np.ndarray) -> np.ndarray:
     ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
     Y, Cr, Cb = cv2.split(ycrcb)
@@ -95,48 +81,36 @@ def skin_mask_ycrcb(rgb: np.ndarray, base_mask01: np.ndarray) -> np.ndarray:
         (ratio > 1.2) & (ratio < 1.6)
     ).astype(np.uint8)
 
-    skin = (skin & (base_mask01 > 0).astype(np.uint8)).astype(np.uint8)
-    skin = _morph_clean(skin, ksize=3, it=1)
-    return skin
+    skin = (skin & base_mask01).astype(np.uint8)
+    return _morph_clean(skin, ksize=3, it=1)
 
-def head_roi_from_person_bbox(person_mask01: np.ndarray, top_ratio: float = 0.22) -> np.ndarray:
-    """
-    顔検出なしの頭部ROI（改善版）：
-    人物マスクの“最上端”から一定高さ（top_ratio）だけを頭部候補にする。
-    bbox基準より衣服が混ざりにくい。
-    """
+# =========================================================
+# head ROI
+# =========================================================
+def head_roi_from_person_bbox(person_mask01: np.ndarray,
+                             top_ratio: float = 0.28) -> np.ndarray:
     ys, xs = np.where(person_mask01 > 0)
     m = np.zeros_like(person_mask01, dtype=np.uint8)
     if len(ys) == 0:
         return m
 
-    y_top = int(ys.min())
-    y_bottom = int(ys.max())
-    x_left = int(xs.min())
-    x_right = int(xs.max())
-
+    y_top, y_bottom = ys.min(), ys.max()
+    x_left, x_right = xs.min(), xs.max()
     h = max(1, y_bottom - y_top + 1)
     head_h = max(1, int(h * top_ratio))
 
-    # “人物の最上端から” head_h だけ
     y1 = y_top
     y2 = min(person_mask01.shape[0], y_top + head_h)
-
     m[y1:y2, x_left:x_right + 1] = 1
-    return (m & (person_mask01 > 0).astype(np.uint8)).astype(np.uint8)
+    return (m & person_mask01).astype(np.uint8)
 
-
+# =========================================================
+# hair (lightweight + position constraint)
+# =========================================================
 def hair_mask_lab(rgb: np.ndarray, person_mask01: np.ndarray,
-                 hair_l_max: float = 65.0, hair_chroma_max: float = 32.0,
-                 head_top_ratio: float = 0.32,
-                 touch_top_tol: int = 6,
-                 keep_upper_centroid_ratio: float = 0.60) -> np.ndarray:
-    """
-    Labの暗色条件で髪候補を作り、
-    connected componentsで「頭頂側にアンカーされている成分」を優先して残す。
-    黒トップス誤除去対策。
-    """
-    head_roi = head_roi_from_person_bbox(person_mask01, top_ratio=head_top_ratio)
+                  hair_l_max: float = 65.0,
+                  hair_chroma_max: float = 32.0) -> np.ndarray:
+    head_roi = head_roi_from_person_bbox(person_mask01, top_ratio=0.28)
     if head_roi.sum() == 0:
         return np.zeros_like(person_mask01, dtype=np.uint8)
 
@@ -146,51 +120,32 @@ def hair_mask_lab(rgb: np.ndarray, person_mask01: np.ndarray,
     b = lab[..., 2] - 128.0
     chroma = np.sqrt(a*a + b*b)
 
-    hair0 = ((L < hair_l_max) & (chroma < hair_chroma_max) & (head_roi > 0)).astype(np.uint8)
+    hair0 = ((L < hair_l_max) &
+             (chroma < hair_chroma_max) &
+             (head_roi > 0)).astype(np.uint8)
+
     hair0 = _morph_clean(hair0, ksize=3, it=1)
 
-    # --- head_roi のy範囲 ---
+    # ---- connected components: 頭頂に接している成分のみ残す ----
     ys_roi = np.where(head_roi > 0)[0]
     if len(ys_roi) == 0:
         return np.zeros_like(person_mask01, dtype=np.uint8)
-    roi_y1, roi_y2 = int(ys_roi.min()), int(ys_roi.max())
-    roi_h = max(1, roi_y2 - roi_y1 + 1)
-    y_split = roi_y1 + int(roi_h * keep_upper_centroid_ratio)  # 上側判定ライン
+    roi_y1 = int(ys_roi.min())
 
-    # --- connected components で「頭頂に近い成分」を残す ---
-    num, labels, stats, centroids = cv2.connectedComponentsWithStats(hair0, connectivity=8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(hair0, connectivity=8)
     out = np.zeros_like(hair0, dtype=np.uint8)
-    if num <= 1:
-        return out
 
     for i in range(1, num):
         x, y, w, h, area = stats[i]
-        cy = centroids[i][1]
-
-        # 1) 上端がROI上端付近にある（頭頂側に接している可能性が高い）
-        cond_touch_top = (y <= roi_y1 + touch_top_tol)
-
-        # 2) 重心がROIの上側にある（服は下側に寄りやすい）
-        cond_upper_centroid = (cy <= y_split)
-
-        # 3) ROI下端にベッタリ届く成分は服由来の可能性が高い（任意）
-        cond_not_too_low = (y + h) < (roi_y2 - 2)
-
-        if (cond_touch_top and cond_upper_centroid) or (cond_touch_top and cond_not_too_low):
+        if y <= roi_y1 + 5:   # ROI上端に接している
             out[labels == i] = 1
 
-    out = _morph_clean(out, ksize=3, it=1)
-    return out
+    return _morph_clean(out, ksize=3, it=1)
 
-
-# -------------------------
-# main api
-# -------------------------
+# =========================================================
+# main API
+# =========================================================
 def clothes_mask(rgb: np.ndarray) -> dict[str, np.ndarray]:
-    """
-    戻り値: {"person","skin","hair","clothes","used_fallback"} (各0/1 + フラグ)
-    rembgが落ちても clothes は必ず返す（ROIフォールバック）
-    """
     h, w = rgb.shape[:2]
     zeros = np.zeros((h, w), dtype=np.uint8)
 
@@ -203,6 +158,11 @@ def clothes_mask(rgb: np.ndarray) -> dict[str, np.ndarray]:
 
     skin = skin_mask_ycrcb(rgb, person) if person.sum() > 0 else zeros.copy()
     hair = hair_mask_lab(rgb, person)   if person.sum() > 0 else zeros.copy()
+
+    # ---- hair gate: 成功時のみ髪除去 ----
+    hair_ratio = hair.sum() / max(1, person.sum())
+    if hair_ratio < 0.003 or hair_ratio > 0.20:
+        hair[:] = 0
 
     clothes = person.astype(np.int16) - skin.astype(np.int16) - hair.astype(np.int16)
     clothes = np.clip(clothes, 0, 1).astype(np.uint8)
