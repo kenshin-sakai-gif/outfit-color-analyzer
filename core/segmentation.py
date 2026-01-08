@@ -127,8 +127,16 @@ def head_roi_from_person_bbox(person_mask01: np.ndarray, top_ratio: float = 0.22
 
 
 def hair_mask_lab(rgb: np.ndarray, person_mask01: np.ndarray,
-                 hair_l_max: float = 65.0, hair_chroma_max: float = 32.0) -> np.ndarray:
-    head_roi = head_roi_from_person_bbox(person_mask01, top_ratio=0.40)
+                 hair_l_max: float = 65.0, hair_chroma_max: float = 32.0,
+                 head_top_ratio: float = 0.32,
+                 touch_top_tol: int = 6,
+                 keep_upper_centroid_ratio: float = 0.60) -> np.ndarray:
+    """
+    Labの暗色条件で髪候補を作り、
+    connected componentsで「頭頂側にアンカーされている成分」を優先して残す。
+    黒トップス誤除去対策。
+    """
+    head_roi = head_roi_from_person_bbox(person_mask01, top_ratio=head_top_ratio)
     if head_roi.sum() == 0:
         return np.zeros_like(person_mask01, dtype=np.uint8)
 
@@ -138,22 +146,41 @@ def hair_mask_lab(rgb: np.ndarray, person_mask01: np.ndarray,
     b = lab[..., 2] - 128.0
     chroma = np.sqrt(a*a + b*b)
 
-    hair = ((L < hair_l_max) & (chroma < hair_chroma_max) & (head_roi > 0)).astype(np.uint8)
-    hair = _morph_clean(hair, ksize=3, it=1)
-    return hair
+    hair0 = ((L < hair_l_max) & (chroma < hair_chroma_max) & (head_roi > 0)).astype(np.uint8)
+    hair0 = _morph_clean(hair0, ksize=3, it=1)
 
-        # 追加：hair候補のうち「上側に寄っている」成分を優先（黒トップス対策）
-    ys2, xs2 = np.where(hair > 0)
-    if len(ys2) > 0:
-        # 髪マスクの平均yが head_roi の下側に寄りすぎてたら捨てる
-        mean_y = float(ys2.mean())
-        # head_roi の範囲を取得
-        ys_roi = np.where(head_roi > 0)[0]
-        if len(ys_roi) > 0:
-            roi_y1, roi_y2 = float(ys_roi.min()), float(ys_roi.max())
-            # 下側寄り（例：head_roiの下半分）なら髪としては怪しい
-            if mean_y > (roi_y1 + roi_y2) / 2.0:
-                hair[:] = 0
+    # --- head_roi のy範囲 ---
+    ys_roi = np.where(head_roi > 0)[0]
+    if len(ys_roi) == 0:
+        return np.zeros_like(person_mask01, dtype=np.uint8)
+    roi_y1, roi_y2 = int(ys_roi.min()), int(ys_roi.max())
+    roi_h = max(1, roi_y2 - roi_y1 + 1)
+    y_split = roi_y1 + int(roi_h * keep_upper_centroid_ratio)  # 上側判定ライン
+
+    # --- connected components で「頭頂に近い成分」を残す ---
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(hair0, connectivity=8)
+    out = np.zeros_like(hair0, dtype=np.uint8)
+    if num <= 1:
+        return out
+
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        cy = centroids[i][1]
+
+        # 1) 上端がROI上端付近にある（頭頂側に接している可能性が高い）
+        cond_touch_top = (y <= roi_y1 + touch_top_tol)
+
+        # 2) 重心がROIの上側にある（服は下側に寄りやすい）
+        cond_upper_centroid = (cy <= y_split)
+
+        # 3) ROI下端にベッタリ届く成分は服由来の可能性が高い（任意）
+        cond_not_too_low = (y + h) < (roi_y2 - 2)
+
+        if (cond_touch_top and cond_upper_centroid) or (cond_touch_top and cond_not_too_low):
+            out[labels == i] = 1
+
+    out = _morph_clean(out, ksize=3, it=1)
+    return out
 
 
 # -------------------------
