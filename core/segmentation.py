@@ -142,6 +142,20 @@ def hair_mask_lab(rgb: np.ndarray, person_mask01: np.ndarray,
     hair = _morph_clean(hair, ksize=3, it=1)
     return hair
 
+        # 追加：hair候補のうち「上側に寄っている」成分を優先（黒トップス対策）
+    ys2, xs2 = np.where(hair > 0)
+    if len(ys2) > 0:
+        # 髪マスクの平均yが head_roi の下側に寄りすぎてたら捨てる
+        mean_y = float(ys2.mean())
+        # head_roi の範囲を取得
+        ys_roi = np.where(head_roi > 0)[0]
+        if len(ys_roi) > 0:
+            roi_y1, roi_y2 = float(ys_roi.min()), float(ys_roi.max())
+            # 下側寄り（例：head_roiの下半分）なら髪としては怪しい
+            if mean_y > (roi_y1 + roi_y2) / 2.0:
+                hair[:] = 0
+
+
 # -------------------------
 # main api
 # -------------------------
