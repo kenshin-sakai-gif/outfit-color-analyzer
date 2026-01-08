@@ -99,19 +99,32 @@ def skin_mask_ycrcb(rgb: np.ndarray, base_mask01: np.ndarray) -> np.ndarray:
     skin = _morph_clean(skin, ksize=3, it=1)
     return skin
 
-def head_roi_from_person_bbox(person_mask01: np.ndarray, top_ratio: float = 0.35) -> np.ndarray:
+def head_roi_from_person_bbox(person_mask01: np.ndarray, top_ratio: float = 0.22) -> np.ndarray:
+    """
+    顔検出なしの頭部ROI（改善版）：
+    人物マスクの“最上端”から一定高さ（top_ratio）だけを頭部候補にする。
+    bbox基準より衣服が混ざりにくい。
+    """
     ys, xs = np.where(person_mask01 > 0)
     m = np.zeros_like(person_mask01, dtype=np.uint8)
     if len(ys) == 0:
         return m
 
-    y1, y2 = int(ys.min()), int(ys.max())
-    x1, x2 = int(xs.min()), int(xs.max())
-    h = max(1, y2 - y1 + 1)
+    y_top = int(ys.min())
+    y_bottom = int(ys.max())
+    x_left = int(xs.min())
+    x_right = int(xs.max())
 
-    top_end = y1 + int(h * top_ratio)
-    m[y1:top_end, x1:x2+1] = 1
+    h = max(1, y_bottom - y_top + 1)
+    head_h = max(1, int(h * top_ratio))
+
+    # “人物の最上端から” head_h だけ
+    y1 = y_top
+    y2 = min(person_mask01.shape[0], y_top + head_h)
+
+    m[y1:y2, x_left:x_right + 1] = 1
     return (m & (person_mask01 > 0).astype(np.uint8)).astype(np.uint8)
+
 
 def hair_mask_lab(rgb: np.ndarray, person_mask01: np.ndarray,
                  hair_l_max: float = 65.0, hair_chroma_max: float = 32.0) -> np.ndarray:
